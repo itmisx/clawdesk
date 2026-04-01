@@ -1,0 +1,10 @@
+build/bin
+**/node_modules
+frontend/dist
+dist
+.claude
+*ClAUDE.md
+build/bin
+build/darwin
+.DS_Store
+Dockerfile.linux

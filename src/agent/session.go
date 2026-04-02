@@ -56,6 +56,7 @@ func (sm *SessionManager) load() {
 	if err != nil {
 		return
 	}
+	sessionMap := make(map[string]bool, len(metas))
 	for _, meta := range metas {
 		// 迁移：清除旧版硬编码的默认提示词，改为空（运行时动态生成）
 		if strings.HasPrefix(meta.SystemPrompt, "你是一个AI助手，可以通过工具帮用户完成实际操作") {
@@ -63,7 +64,29 @@ func (sm *SessionManager) load() {
 			sm.memMgr.Store.SaveMeta(&meta)
 		}
 		sm.sessions[meta.ID] = metaToSession(&meta)
-		sm.order = append(sm.order, meta.ID)
+		sessionMap[meta.ID] = true
+	}
+
+	// 优先从持久化的排序恢复
+	if saved := sm.memMgr.Store.LoadOrder(); len(saved) > 0 {
+		seen := make(map[string]bool, len(saved))
+		for _, id := range saved {
+			if sessionMap[id] && !seen[id] {
+				sm.order = append(sm.order, id)
+				seen[id] = true
+			}
+		}
+		// 补上新增的（不在 order.json 中的）
+		for id := range sessionMap {
+			if !seen[id] {
+				sm.order = append(sm.order, id)
+			}
+		}
+	} else {
+		// 无持久化排序，按 ListSessions 返回顺序
+		for _, meta := range metas {
+			sm.order = append(sm.order, meta.ID)
+		}
 	}
 }
 
@@ -174,7 +197,7 @@ func (sm *SessionManager) UpdateBot(id string, opts BotOptions) {
 	sm.memMgr.Store.SaveMeta(sessionToMeta(s))
 }
 
-// Reorder 重新排序助手
+// Reorder 重新排序助手（持久化到 order.json）
 func (sm *SessionManager) Reorder(ids []string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -199,6 +222,7 @@ func (sm *SessionManager) Reorder(ids []string) {
 		}
 	}
 	sm.order = newOrder
+	sm.memMgr.Store.SaveOrder(newOrder)
 }
 
 // Delete 删除助手

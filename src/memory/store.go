@@ -97,6 +97,34 @@ func (ds *DailyStore) ListSessions() ([]SessionMeta, error) {
 	return sessions, nil
 }
 
+// ===== 排序 =====
+
+func (ds *DailyStore) orderFile() string {
+	return filepath.Join(ds.baseDir, "order.json")
+}
+
+// SaveOrder 保存助手排序
+func (ds *DailyStore) SaveOrder(ids []string) error {
+	data, err := json.Marshal(ids)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(ds.orderFile(), data, 0644)
+}
+
+// LoadOrder 加载助手排序，文件不存在返回 nil
+func (ds *DailyStore) LoadOrder() []string {
+	data, err := os.ReadFile(ds.orderFile())
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	if json.Unmarshal(data, &ids) != nil {
+		return nil
+	}
+	return ids
+}
+
 // ===== 消息 JSONL =====
 
 func (ds *DailyStore) dayFileName(t time.Time) string {

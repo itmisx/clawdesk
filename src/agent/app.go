@@ -81,7 +81,49 @@ func (a *App) Startup(ctx context.Context) {
 		}
 		return DoNonStreamRequest(callCtx, msgs)
 	}
-	a.skillMgr = skill.NewManager(ctx, llmCall)
+
+	// 创建带工具调用的 LLM 闭包（注入给 Skill Vetter 安全审查）
+	vetLLMCall := func(callCtx context.Context, vetMsgs []skill.VetMessage, tools []map[string]any) (*skill.VetLLMResponse, error) {
+		// 将 VetMessage 转换为 Message
+		msgs := make([]Message, len(vetMsgs))
+		for i, vm := range vetMsgs {
+			msgs[i] = Message{
+				Role:       vm.Role,
+				Content:    vm.Content,
+				ToolCallID: vm.ToolCallID,
+				Name:       vm.Name,
+			}
+			// 转换 tool_calls
+			if len(vm.ToolCalls) > 0 {
+				msgs[i].ToolCalls = make([]ToolCall, len(vm.ToolCalls))
+				for j, tc := range vm.ToolCalls {
+					msgs[i].ToolCalls[j] = ToolCall{
+						ID:   tc.ID,
+						Type: "function",
+						Function: FunctionCall{
+							Name:      tc.Name,
+							Arguments: tc.Arguments,
+						},
+					}
+				}
+			}
+		}
+		resp, err := DoNonStreamRequestWithTools(callCtx, msgs, tools)
+		if err != nil {
+			return nil, err
+		}
+		// 转换响应
+		vetResp := &skill.VetLLMResponse{Content: resp.Content}
+		for _, tc := range resp.ToolCalls {
+			vetResp.ToolCalls = append(vetResp.ToolCalls, skill.VetToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
+		return vetResp, nil
+	}
+	a.skillMgr = skill.NewManager(ctx, llmCall, vetLLMCall)
 
 	// 初始化记忆管理器
 	memMgr, err := memory.NewMemoryManager(config.GetConfigDir(), llmCall)

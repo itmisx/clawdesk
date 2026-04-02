@@ -64,8 +64,33 @@ type Skill struct {
 	SecurityNote  string     `yaml:"-" json:"securityNote,omitempty"`  // 安全审查备注
 }
 
-// LLMCallFunc LLM 调用函数类型（用于安全检查等内部功能）
+// LLMCallFunc LLM 调用函数类型（用于压缩器等内部功能）
 type LLMCallFunc func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+
+// VetToolCall 安全审查中 LLM 发起的工具调用
+type VetToolCall struct {
+	ID       string
+	Name     string
+	Arguments string
+}
+
+// VetLLMResponse 安全审查 LLM 响应
+type VetLLMResponse struct {
+	Content   string
+	ToolCalls []VetToolCall
+}
+
+// VetLLMCallFunc 带工具调用的 LLM 请求函数（用于 Skill Vetter 安全审查）
+type VetLLMCallFunc func(ctx context.Context, messages []VetMessage, tools []map[string]any) (*VetLLMResponse, error)
+
+// VetMessage 安全审查消息
+type VetMessage struct {
+	Role       string `json:"role"`
+	Content    string `json:"content"`
+	ToolCalls  []VetToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Name       string `json:"name,omitempty"`
+}
 
 // Manager 技能管理器
 type Manager struct {
@@ -74,7 +99,8 @@ type Manager struct {
 	builtinExecutors  map[string]func(args map[string]any) ToolResult
 	mcpClients        map[string]*MCPClient // skillName -> MCP client
 	nextOrder         int                   // 自增序号，用于安装排序
-	llmCall           LLMCallFunc           // LLM 调用（用于 Skill Vetter 安全检查）
+	llmCall           LLMCallFunc           // LLM 调用（用于压缩器等）
+	vetLLMCall        VetLLMCallFunc        // 带工具调用的 LLM 请求（用于 Skill Vetter 安全审查）
 	lastSkillDirMod   time.Time             // skills 目录最后修改时间（跳过无变化的扫描）
 	workspaceResolver func() string         // 返回当前会话的 workspace 目录
 }
@@ -132,13 +158,14 @@ func (m *Manager) sanitizeOutput(text string) string {
 }
 
 // NewManager 创建技能管理器
-func NewManager(ctx context.Context, llmCall LLMCallFunc) *Manager {
+func NewManager(ctx context.Context, llmCall LLMCallFunc, vetLLMCall VetLLMCallFunc) *Manager {
 	m := &Manager{
 		skills:           make(map[string]*Skill),
 		builtinExecutors: make(map[string]func(args map[string]any) ToolResult),
 		mcpClients:       make(map[string]*MCPClient),
 		nextOrder:        100, // 内置技能用 0~99，自定义从 100 开始
 		llmCall:          llmCall,
+		vetLLMCall:       vetLLMCall,
 	}
 	m.registerBuiltins()
 	m.loadCustomSkills(ctx)
@@ -152,8 +179,9 @@ type VetResult struct {
 }
 
 // VetSkill 使用 Skill Vetter 检查待安装技能的安全性
+// skillDir 是技能目录的绝对路径，LLM 会通过工具自主扫描目录下所有文件
 // 返回 VetResult + error（error 非 nil 表示被拒绝）
-func (m *Manager) VetSkill(skillName, skillContent string) (VetResult, error) {
+func (m *Manager) VetSkill(skillName, skillDir string) (VetResult, error) {
 	// Skill Vetter 自身不检查
 	if skillName == "skill-vetter" {
 		return VetResult{Level: "safe", Note: "Skill Vetter 自身"}, nil
@@ -187,29 +215,175 @@ func (m *Manager) VetSkill(skillName, skillContent string) (VetResult, error) {
 		fmt.Println("已自动安装 Skill Vetter")
 	}
 
-	if m.llmCall == nil {
+	if m.vetLLMCall == nil {
 		return VetResult{}, nil
 	}
 
-	// LLM 审查提示词：要求返回 PASS:safe:备注 或 PASS:caution:备注 或 REJECT:原因
-	systemPrompt := vetter.Content + `
-
-请严格审查以下技能的安全性，按以下格式回复（只回复一行）：
-- 安全无风险: PASS:safe:简要说明
-- 通过但有轻微风险: PASS:caution:风险说明
-- 有明确安全风险: REJECT:拒绝原因`
-
-	userPrompt := fmt.Sprintf("技能名称: %s\n\n技能内容:\n%s", skillName, skillContent)
-
-	result, err := m.llmCall(context.Background(), systemPrompt, userPrompt)
-	if err != nil {
-		return VetResult{}, nil // LLM 调用失败，不阻塞
+	// 构建审查工具定义（只提供 list_directory 和 read_file）
+	vetTools := []map[string]any{
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "list_directory",
+				"description": "列出指定目录下的文件和文件夹",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "目录路径"},
+					},
+					"required": []string{"path"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "read_file",
+				"description": "读取指定文件的文本内容",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "文件路径"},
+					},
+					"required": []string{"path"},
+				},
+			},
+		},
 	}
 
-	result = strings.TrimSpace(result)
+	// LLM 审查提示词
+	systemPrompt := vetter.Content + fmt.Sprintf(`
+
+你正在审查一个待安装的技能，技能目录: %s
+请使用 list_directory 和 read_file 工具扫描该目录下的所有文件（包括子目录中的脚本、配置文件等），全面审查安全性。
+
+审查要点：
+1. SKILL.md / skill.yaml 中的命令和描述
+2. 目录下所有脚本文件（.sh, .py, .js, .bat 等）的实际内容
+3. 是否存在命令注入、数据外泄、恶意下载执行等风险
+4. 是否有可疑的网络请求、文件系统越权访问
+
+审查完成后，按以下格式回复最终结论（只回复一行）：
+- 安全无风险: PASS:safe:简要说明
+- 通过但有轻微风险: PASS:caution:风险说明
+- 有明确安全风险: REJECT:拒绝原因`, skillDir)
+
+	userPrompt := fmt.Sprintf("请审查技能: %s\n技能目录: %s\n\n请先用 list_directory 查看目录结构，再逐个 read_file 检查所有文件内容。", skillName, skillDir)
+
+	// 构建消息列表
+	messages := []VetMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}
+
+	// Function Calling 循环（最多 10 轮）
+	ctx := context.Background()
+	for i := 0; i < 10; i++ {
+		resp, err := m.vetLLMCall(ctx, messages, vetTools)
+		if err != nil {
+			fmt.Printf("Skill Vetter LLM 调用失败: %v，跳过安全检查\n", err)
+			return VetResult{}, nil
+		}
+
+		// 无工具调用，解析最终结果
+		if len(resp.ToolCalls) == 0 {
+			return parseVetResult(resp.Content)
+		}
+
+		// 将 assistant 消息（含 tool_calls）加入消息列表
+		messages = append(messages, VetMessage{
+			Role:      "assistant",
+			Content:   resp.Content,
+			ToolCalls: resp.ToolCalls,
+		})
+
+		// 执行工具调用
+		for _, tc := range resp.ToolCalls {
+			output := m.executeVetTool(tc.Name, tc.Arguments, skillDir)
+			messages = append(messages, VetMessage{
+				Role:       "tool",
+				Content:    output,
+				ToolCallID: tc.ID,
+				Name:       tc.Name,
+			})
+		}
+	}
+
+	return VetResult{}, fmt.Errorf("安全审查工具调用次数超过限制")
+}
+
+// executeVetTool 执行安全审查工具（限制在技能目录内）
+func (m *Manager) executeVetTool(name, argsJSON, skillDir string) string {
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return fmt.Sprintf("参数解析失败: %v", err)
+	}
+
+	path, _ := args["path"].(string)
+	if path == "" {
+		return "错误: path 参数为空"
+	}
+
+	// 安全限制：路径必须在技能目录内
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Sprintf("路径错误: %v", err)
+	}
+	if !strings.HasPrefix(absPath, skillDir) {
+		return fmt.Sprintf("安全限制: 只能访问技能目录 %s 内的文件", skillDir)
+	}
+
+	switch name {
+	case "list_directory":
+		entries, err := os.ReadDir(absPath)
+		if err != nil {
+			return fmt.Sprintf("读取目录失败: %v", err)
+		}
+		var sb strings.Builder
+		for _, entry := range entries {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			if entry.IsDir() {
+				fmt.Fprintf(&sb, "[目录] %s\n", entry.Name())
+			} else {
+				fmt.Fprintf(&sb, "[文件] %s (%d bytes)\n", entry.Name(), info.Size())
+			}
+		}
+		if sb.Len() == 0 {
+			return "目录为空"
+		}
+		return sb.String()
+
+	case "read_file":
+		info, err := os.Stat(absPath)
+		if err != nil {
+			return fmt.Sprintf("文件不存在: %v", err)
+		}
+		if info.Size() > 1*1024*1024 {
+			return "文件过大（>1MB），跳过"
+		}
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			return fmt.Sprintf("读取失败: %v", err)
+		}
+		content := string(data)
+		if len(content) > 8000 {
+			content = content[:8000] + "\n... (内容被截断)"
+		}
+		return content
+
+	default:
+		return fmt.Sprintf("未知工具: %s", name)
+	}
+}
+
+// parseVetResult 解析 LLM 返回的审查结论
+func parseVetResult(text string) (VetResult, error) {
+	result := strings.TrimSpace(text)
 	upper := strings.ToUpper(result)
 
-	// 解析格式：PASS:level:note 或 REJECT:reason
 	if strings.Contains(upper, "REJECT") {
 		reason := result
 		if idx := strings.Index(upper, "REJECT:"); idx >= 0 {
@@ -221,7 +395,6 @@ func (m *Manager) VetSkill(skillName, skillContent string) (VetResult, error) {
 	if strings.Contains(upper, "PASS") {
 		level := "safe"
 		note := ""
-		// 尝试解析 PASS:level:note 格式
 		if idx := strings.Index(upper, "PASS:"); idx >= 0 {
 			parts := strings.SplitN(result[idx+5:], ":", 2)
 			if len(parts) >= 1 {
@@ -460,14 +633,11 @@ func (m *Manager) ReloadCustomSkills(ctx context.Context) {
 	// 对新技能进行安全检查（不持锁，VetSkill 内部会获取读锁）
 	var vetted []*Skill
 	for _, s := range newSkills {
-		content := s.Content
-		if content == "" {
-			content = s.Description
-		}
-		vetResult, err := m.VetSkill(s.Name, content)
+		skillDir := filepath.Join(dir, s.Name)
+		vetResult, err := m.VetSkill(s.Name, skillDir)
 		if err != nil {
 			println("技能安全检查未通过:", s.Name, err.Error())
-			os.RemoveAll(filepath.Join(dir, s.Name))
+			os.RemoveAll(skillDir)
 			continue
 		}
 		s.SecurityLevel = vetResult.Level
@@ -574,11 +744,8 @@ func (m *Manager) InstallFromYAML(yamlContent string) error {
 // Install 安装新技能（Agent Skill）
 func (m *Manager) Install(s Skill) error {
 	// 安全检查（在获取锁之前，避免 VetSkill 内部读锁死锁）
-	content := s.Content
-	if content == "" {
-		content = s.Description
-	}
-	vetResult, err := m.VetSkill(s.Name, content)
+	skillDir := filepath.Join(skillsDir(), s.Name)
+	vetResult, err := m.VetSkill(s.Name, skillDir)
 	if err != nil {
 		return err
 	}

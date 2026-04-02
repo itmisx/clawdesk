@@ -391,28 +391,51 @@ func streamChat(ctx context.Context, messages []Message, skillMgr *skill.Manager
 
 // DoNonStreamRequest 非流式 LLM 请求（供压缩器等内部功能调用）
 func DoNonStreamRequest(ctx context.Context, messages []Message) (string, error) {
+	resp, err := doNonStreamRequestRaw(ctx, messages, nil)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
+}
+
+// NonStreamResponse 非流式请求的完整响应（含 tool_calls）
+type NonStreamResponse struct {
+	Content   string
+	ToolCalls []ToolCall
+}
+
+// DoNonStreamRequestWithTools 带工具定义的非流式 LLM 请求
+func DoNonStreamRequestWithTools(ctx context.Context, messages []Message, tools []map[string]any) (*NonStreamResponse, error) {
+	return doNonStreamRequestRaw(ctx, messages, tools)
+}
+
+// doNonStreamRequestRaw 非流式请求底层实现
+func doNonStreamRequestRaw(ctx context.Context, messages []Message, tools []map[string]any) (*NonStreamResponse, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		return "", fmt.Errorf("加载配置失败: %w", err)
+		return nil, fmt.Errorf("加载配置失败: %w", err)
 	}
 
 	provider := config.GetActiveProvider(cfg)
 	if provider == nil {
-		return "", fmt.Errorf("未配置模型厂商")
+		return nil, fmt.Errorf("未配置模型厂商")
 	}
 	if provider.APIKey == "" {
-		return "", fmt.Errorf("请先配置 API Key")
+		return nil, fmt.Errorf("请先配置 API Key")
 	}
 
 	modelName := config.GetActiveModelName(cfg)
 	if modelName == "" {
-		return "", fmt.Errorf("未选择模型")
+		return nil, fmt.Errorf("未选择模型")
 	}
 
 	reqBody := map[string]any{
 		"model":    modelName,
 		"messages": messages,
 		"stream":   false,
+	}
+	if len(tools) > 0 {
+		reqBody["tools"] = tools
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -421,30 +444,34 @@ func DoNonStreamRequest(ctx context.Context, messages []Message) (string, error)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if len(result.Choices) > 0 {
-		return result.Choices[0].Message.Content, nil
+		return &NonStreamResponse{
+			Content:   result.Choices[0].Message.Content,
+			ToolCalls: result.Choices[0].Message.ToolCalls,
+		}, nil
 	}
-	return "", fmt.Errorf("LLM 返回空结果")
+	return nil, fmt.Errorf("LLM 返回空结果")
 }

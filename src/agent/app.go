@@ -79,7 +79,7 @@ func (a *App) Startup(ctx context.Context) {
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		}
-		return DoNonStreamRequest(callCtx, msgs)
+		return DoNonStreamRequest(callCtx, msgs, nil)
 	}
 
 	// 创建带工具调用的 LLM 闭包（注入给 Skill Vetter 安全审查）

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,16 +14,22 @@ import (
 
 // Config 记忆系统配置
 type Config struct {
-	RecentKeep        int // 保留最近消息数（默认 10）
-	VectorTopK        int // 向量搜索返回数（默认 5）
-	CompressThreshold int // 触发压缩的消息阈值（默认 50）
+	RecentKeep          int     // 保留最近消息数上限（默认 10）
+	RecentTokenBudget   int     // 近期消息 token 预算（默认 4000，用 rune 数估算）
+	VectorTopK          int     // 向量搜索返回数（默认 5）
+	CompressThreshold   int     // 触发压缩的消息阈值（默认 50）
+	SimilarityThreshold float64 // 向量检索最低相似度（默认 0.5）
+	TimeDecayRate       float64 // 时间衰减系数（每天衰减比例，默认 0.005）
 }
 
 func DefaultConfig() Config {
 	return Config{
-		RecentKeep:        10,
-		VectorTopK:        5,
-		CompressThreshold: 50,
+		RecentKeep:          10,
+		RecentTokenBudget:   4000,
+		VectorTopK:          5,
+		CompressThreshold:   50,
+		SimilarityThreshold: 0.5,
+		TimeDecayRate:       0.005,
 	}
 }
 
@@ -140,8 +147,9 @@ func (mm *MemoryManager) BuildContext(sessionID string, systemPrompt string, use
 		Content:   enhancedPrompt,
 	})
 
-	// === 2. 加载最近消息 ===
+	// === 2. 加载最近消息（自适应 token 预算） ===
 	loadStart := time.Now()
+	// 多加载一些消息用于 token 预算裁剪（+1 用于排除当前输入）
 	recentMsgs, _ := mm.Store.LoadRecentMessages(sessionID, mm.config.RecentKeep+1)
 	mm.logStorage("load_messages", sessionID, "", fmt.Sprintf("loaded %d recent messages", len(recentMsgs)), 0, len(recentMsgs), time.Since(loadStart).Milliseconds(), true, "")
 
@@ -150,6 +158,23 @@ func (mm *MemoryManager) BuildContext(sessionID string, systemPrompt string, use
 		last := recentMsgs[len(recentMsgs)-1]
 		if last.Role == "user" && last.Content == userInput {
 			recentMsgs = recentMsgs[:len(recentMsgs)-1]
+		}
+	}
+
+	// 基于 token 预算裁剪：从最新消息向前累加 rune 数，超出预算时截断
+	if mm.config.RecentTokenBudget > 0 && len(recentMsgs) > 0 {
+		runeCount := 0
+		cutoff := 0
+		for i := len(recentMsgs) - 1; i >= 0; i-- {
+			msgRunes := len([]rune(fmt.Sprintf("%v", recentMsgs[i].Content)))
+			if runeCount+msgRunes > mm.config.RecentTokenBudget && i < len(recentMsgs)-1 {
+				cutoff = i + 1
+				break
+			}
+			runeCount += msgRunes
+		}
+		if cutoff > 0 {
+			recentMsgs = recentMsgs[cutoff:]
 		}
 	}
 
@@ -166,18 +191,34 @@ func (mm *MemoryManager) BuildContext(sessionID string, systemPrompt string, use
 					recentTSSet[m.Timestamp.Format(time.RFC3339Nano)] = true
 				}
 
-				var filtered []SearchResult
+				// 应用时间衰减权重并过滤
+				type scoredResult struct {
+					SearchResult
+					adjustedScore float64
+				}
+				var filtered []scoredResult
+				now := time.Now()
 				for _, r := range results {
 					if recentTSSet[r.MessageTS.Format(time.RFC3339Nano)] {
 						continue // 跳过已在最近消息中的
 					}
-					if r.Similarity < 0.5 {
+					if r.Similarity < mm.config.SimilarityThreshold {
 						continue // 相似度过低
 					}
-					filtered = append(filtered, r)
-					if len(filtered) >= mm.config.VectorTopK {
-						break
+					// 时间衰减：近期消息轻微加权
+					daysSince := now.Sub(r.MessageTS).Hours() / 24
+					decay := 1.0 - mm.config.TimeDecayRate*daysSince
+					if decay < 0.1 {
+						decay = 0.1 // 最低保留 10% 权重
 					}
+					filtered = append(filtered, scoredResult{r, r.Similarity * decay})
+				}
+				// 按调整后分数重新排序
+				sort.Slice(filtered, func(i, j int) bool {
+					return filtered[i].adjustedScore > filtered[j].adjustedScore
+				})
+				if len(filtered) > mm.config.VectorTopK {
+					filtered = filtered[:mm.config.VectorTopK]
 				}
 
 				if len(filtered) > 0 {

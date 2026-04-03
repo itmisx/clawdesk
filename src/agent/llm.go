@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -390,8 +391,8 @@ func streamChat(ctx context.Context, messages []Message, skillMgr *skill.Manager
 }
 
 // DoNonStreamRequest 非流式 LLM 请求（供压缩器等内部功能调用）
-func DoNonStreamRequest(ctx context.Context, messages []Message) (string, error) {
-	resp, err := doNonStreamRequestRaw(ctx, messages, nil)
+func DoNonStreamRequest(ctx context.Context, messages []Message, opts *LLMOptions) (string, error) {
+	resp, err := doNonStreamRequestRaw(ctx, messages, nil, opts)
 	if err != nil {
 		return "", err
 	}
@@ -406,25 +407,45 @@ type NonStreamResponse struct {
 
 // DoNonStreamRequestWithTools 带工具定义的非流式 LLM 请求
 func DoNonStreamRequestWithTools(ctx context.Context, messages []Message, tools []map[string]any) (*NonStreamResponse, error) {
-	return doNonStreamRequestRaw(ctx, messages, tools)
+	return doNonStreamRequestRaw(ctx, messages, tools, nil)
 }
 
 // doNonStreamRequestRaw 非流式请求底层实现
-func doNonStreamRequestRaw(ctx context.Context, messages []Message, tools []map[string]any) (*NonStreamResponse, error) {
+func doNonStreamRequestRaw(ctx context.Context, messages []Message, tools []map[string]any, opts *LLMOptions) (*NonStreamResponse, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, fmt.Errorf("加载配置失败: %w", err)
 	}
 
-	provider := config.GetActiveProvider(cfg)
+	// 确定使用哪个 provider 和 model（与流式请求逻辑一致）
+	var provider *config.ModelProvider
+	var modelName string
+
+	if opts != nil && opts.ProviderID != "" && opts.Model != "" {
+		// 助手绑定了特定模型
+		for i, p := range cfg.Providers {
+			if p.ID == opts.ProviderID {
+				provider = &cfg.Providers[i]
+				break
+			}
+		}
+		modelName = opts.Model
+	}
+
+	// 未绑定或未找到绑定的 provider，回退到全局配置
+	if provider == nil {
+		provider = config.GetActiveProvider(cfg)
+	}
+	if modelName == "" {
+		modelName = config.GetActiveModelName(cfg)
+	}
+
 	if provider == nil {
 		return nil, fmt.Errorf("未配置模型厂商")
 	}
 	if provider.APIKey == "" {
 		return nil, fmt.Errorf("请先配置 API Key")
 	}
-
-	modelName := config.GetActiveModelName(cfg)
 	if modelName == "" {
 		return nil, fmt.Errorf("未选择模型")
 	}
@@ -454,6 +475,11 @@ func doNonStreamRequestRaw(ctx context.Context, messages []Message, tools []map[
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API 返回错误(%d): %s", resp.StatusCode, string(errBody))
+	}
 
 	var result struct {
 		Choices []struct {

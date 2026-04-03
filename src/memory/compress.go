@@ -98,6 +98,9 @@ func (c *Compressor) Compress(ctx context.Context, sessionID string, recentKeep 
 	if existingSummary != nil && existingSummary.Summary != "" {
 		prompt.WriteString("以下是之前的对话摘要：\n")
 		prompt.WriteString(existingSummary.Summary)
+		if len([]rune(existingSummary.Summary)) > 1500 {
+			prompt.WriteString("\n\n注意：旧摘要较长，请精简旧摘要内容，控制总字数在500字以内。\n")
+		}
 		prompt.WriteString("\n\n以下是新增的对话内容，请在原有摘要基础上整合为一份完整摘要：\n\n")
 	} else {
 		prompt.WriteString("请简洁总结以下对话内容，保留关键事实、决策和重要上下文：\n\n")
@@ -125,6 +128,12 @@ func (c *Compressor) Compress(ctx context.Context, sessionID string, recentKeep 
 	)
 	if err != nil {
 		return nil, fmt.Errorf("压缩调用 LLM 失败: %w", err)
+	}
+
+	// 硬截断：防止多轮增量压缩后摘要无限膨胀
+	const maxSummaryRunes = 2000
+	if len([]rune(summary)) > maxSummaryRunes {
+		summary = string([]rune(summary)[:maxSummaryRunes]) + "..."
 	}
 
 	result := &CompressSummary{

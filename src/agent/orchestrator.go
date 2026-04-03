@@ -424,7 +424,7 @@ func (o *Orchestrator) makePlan(ctx context.Context, userInput string, messages 
 
 	msgs = append(msgs, Message{Role: "user", Content: userInput})
 
-	resp, err := DoNonStreamRequest(ctx, msgs)
+	resp, err := DoNonStreamRequest(ctx, msgs, nil)
 	if err != nil {
 		return nil, err
 	}

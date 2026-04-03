@@ -439,8 +439,14 @@ func (s *Scheduler) runPrompt(sessionID, prompt string) (string, error) {
 	messages = append(messages, Message{Role: "user", Content: prompt})
 	s.app.saveRequestLog(sessionID, messages)
 
+	// 构建模型覆盖参数（使用助手绑定的模型）
+	var llmOpts *LLMOptions
+	if session.ProviderID != "" && session.Model != "" {
+		llmOpts = &LLMOptions{ProviderID: session.ProviderID, Model: session.Model}
+	}
+
 	// 非流式执行（定时任务不需要工具调用，避免意外触发 create_bot 等副作用）
-	fullResponse, err := DoNonStreamRequest(s.ctx, messages)
+	fullResponse, err := DoNonStreamRequest(s.ctx, messages, llmOpts)
 	if err != nil {
 		return "", err
 	}

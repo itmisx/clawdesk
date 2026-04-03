@@ -233,6 +233,13 @@ func defaultProviders() []ModelProvider {
 			Models:  []string{"qwen3.5-plus", "qwen3-coder-plus", "qwen3-coder-next"},
 		},
 		{
+			ID:      "openrouter",
+			Name:    "OpenRouter",
+			BaseURL: "https://openrouter.ai/api/v1",
+			APIKey:  "",
+			Models:  []string{"openai/gpt-4o", "anthropic/claude-sonnet-4-20250514", "google/gemini-2.5-flash", "deepseek/deepseek-chat-v3-0324"},
+		},
+		{
 			ID:      "ollama",
 			Name:    "Ollama",
 			BaseURL: "http://localhost:11434/v1",
@@ -308,23 +315,29 @@ func FetchModels(provider *ModelProvider) ([]string, error) {
 
 // filterMainModel 过滤只保留主要聊天模型
 func filterMainModel(id string) bool {
+	// 对 OpenRouter 格式 "provider/model"，取 model 部分用于过滤
+	lower := strings.ToLower(id)
+	modelPart := lower
+	if idx := strings.LastIndex(lower, "/"); idx >= 0 {
+		modelPart = lower[idx+1:]
+	}
+
 	// 排除的关键词
 	excludes := []string{
 		"embed", "tts", "whisper", "dall-e", "davinci", "babbage",
 		"curie", "ada", "moderation", "search", "similarity",
 		"code-", "text-", "audio", "realtime", "transcribe",
-		"-preview", "instruct",
+		"instruct",
 	}
-	lower := strings.ToLower(id)
 	for _, ex := range excludes {
-		if strings.Contains(lower, ex) {
+		if strings.Contains(modelPart, ex) {
 			return false
 		}
 	}
 	// 只保留包含这些关键词的模型
 	includes := []string{"gpt", "o1", "o3", "o4", "claude", "chat", "deepseek", "qwen", "glm", "gemini", "mistral", "llama", "kimi", "moonshot"}
 	for _, inc := range includes {
-		if strings.Contains(lower, inc) {
+		if strings.Contains(modelPart, inc) {
 			return true
 		}
 	}

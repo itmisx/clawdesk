@@ -35,15 +35,21 @@ func SearchClawHub(query string) ([]ClawHubSkill, error) {
 	}
 	defer page.Close()
 
+	// 访问技能页（搜索词和排序都通过 URL 参数传递，确保服务端返回按下载量排序的结果）
 	// 访问技能页
-	if _, err := page.Goto("https://clawhub.ai/skills?sort=downloads", playwright.PageGotoOptions{
+	if _, err := page.Goto("https://clawhub.ai/skills", playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateNetworkidle,
 		Timeout:   playwright.Float(30000),
 	}); err != nil {
 		return nil, fmt.Errorf("访问 clawhub.ai 失败: %w", err)
 	}
 
-	// 找到搜索框并输入关键词
+	// 选择按下载量排序（select.skills-sort）
+	page.Locator("select.skills-sort").SelectOption(playwright.SelectOptionValues{
+		Values: playwright.StringSlice("downloads"),
+	})
+
+	// 输入搜索关键词
 	input := page.Locator("input.skills-search-input")
 	if err := input.Fill(query); err != nil {
 		return nil, fmt.Errorf("填写搜索框失败: %w", err)

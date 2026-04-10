@@ -1,12 +1,18 @@
 package skill
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -90,6 +96,19 @@ func (m *Manager) registerBuiltins() {
 				Execute: ToolExecute{Type: "builtin"},
 			},
 			{
+				Name:        "web_search",
+				Description: "搜索互联网获取实时信息。返回搜索结果的标题、URL 和摘要。",
+				Parameters: ToolParam{
+					Type: "object",
+					Properties: map[string]PropDef{
+						"query": {Type: "string", Description: "搜索关键词"},
+						"limit": {Type: "number", Description: "返回结果数量（可选，默认 5，最大 10）"},
+					},
+					Required: []string{"query"},
+				},
+				Execute: ToolExecute{Type: "builtin"},
+			},
+			{
 				Name:        "plan_and_execute",
 				Description: "当任务需要多个独立步骤并行执行时调用此工具（如同时查天气和查GitHub）。简单任务不要调用。参数为执行计划的 JSON。",
 				Parameters: ToolParam{
@@ -147,6 +166,63 @@ func (m *Manager) registerBuiltins() {
 						"name":   {Type: "string", Description: "uninstall 时必填，技能名称"},
 					},
 					Required: []string{"action"},
+				},
+				Execute: ToolExecute{Type: "builtin"},
+			},
+			{
+				Name:        "glob_file",
+				Description: "按文件名模式搜索文件路径。支持 glob 通配符，如 **/*.go、src/**/*.vue、*.md。返回匹配的文件路径列表。适合在不知道文件确切位置时快速定位文件。",
+				Parameters: ToolParam{
+					Type: "object",
+					Properties: map[string]PropDef{
+						"pattern": {Type: "string", Description: "glob 模式，如 **/*.go、src/**/*.ts、*.md"},
+						"path":    {Type: "string", Description: "搜索根目录（可选，默认使用会话 workspace）"},
+					},
+					Required: []string{"pattern"},
+				},
+				Execute: ToolExecute{Type: "builtin"},
+			},
+			{
+				Name:        "grep_file",
+				Description: "按正则表达式搜索文件内容。返回匹配的 文件:行号:内容。适合查找函数定义、变量引用、错误信息等在代码中的位置。",
+				Parameters: ToolParam{
+					Type: "object",
+					Properties: map[string]PropDef{
+						"pattern":        {Type: "string", Description: "正则表达式，如 func main、TODO.*fix、import.*react"},
+						"path":           {Type: "string", Description: "搜索目录或文件路径（可选，默认使用会话 workspace）"},
+						"include":        {Type: "string", Description: "文件名过滤 glob（可选），如 *.go、*.{ts,tsx}"},
+						"caseSensitive":  {Type: "boolean", Description: "是否区分大小写（可选，默认 true）"},
+					},
+					Required: []string{"pattern"},
+				},
+				Execute: ToolExecute{Type: "builtin"},
+			},
+			{
+				Name:        "edit_file",
+				Description: "精确替换文件中的文本片段，无需重写整个文件。old_text 必须与文件中的内容完全匹配（包括缩进和空白）。比 write_file 更安全高效，适合修改代码中的特定函数、变量或配置。",
+				Parameters: ToolParam{
+					Type: "object",
+					Properties: map[string]PropDef{
+						"path":       {Type: "string", Description: "文件路径（绝对路径或相对于 workspace 的路径）"},
+						"old_text":   {Type: "string", Description: "要被替换的原始文本（必须与文件内容完全匹配）"},
+						"new_text":   {Type: "string", Description: "替换后的新文本"},
+						"replaceAll": {Type: "boolean", Description: "是否替换所有匹配项（可选，默认 false，只替换第一个）"},
+					},
+					Required: []string{"path", "old_text", "new_text"},
+				},
+				Execute: ToolExecute{Type: "builtin"},
+			},
+			{
+				Name:        "file_tree",
+				Description: "递归显示目录树结构。一次调用即可了解项目整体文件布局，比多次调用 list_directory 更高效。自动跳过 .git、node_modules 等目录。",
+				Parameters: ToolParam{
+					Type: "object",
+					Properties: map[string]PropDef{
+						"path":    {Type: "string", Description: "目录路径（可选，默认使用会话 workspace）"},
+						"depth":   {Type: "number", Description: "递归深度（可选，默认 3，最大 6）"},
+						"pattern": {Type: "string", Description: "文件名过滤 glob（可选），如 *.go、*.vue，为空则显示全部"},
+					},
+					Required: []string{},
 				},
 				Execute: ToolExecute{Type: "builtin"},
 			},
@@ -362,6 +438,181 @@ func (m *Manager) registerBuiltins() {
 		body, _ := args["body"].(string)
 
 		return ToolResult{Output: fetchURL(url, method, headersJSON, body), Success: true}
+	})
+
+	// ===== web_search executor =====
+	m.RegisterBuiltinExecutor("web_search", func(args map[string]any) ToolResult {
+		query, _ := args["query"].(string)
+		if query == "" {
+			return ToolResult{Output: "错误: query 参数为空", Success: false}
+		}
+		limit := 5
+		if v, ok := args["limit"].(float64); ok && v >= 1 {
+			limit = int(v)
+			if limit > 10 {
+				limit = 10
+			}
+		}
+		results := webSearch(query, limit)
+		if results == "" {
+			return ToolResult{Output: "搜索无结果", Success: true}
+		}
+		return ToolResult{Output: results, Success: true}
+	})
+
+	// ===== file_tree executor =====
+	m.RegisterBuiltinExecutor("file_tree", func(args map[string]any) ToolResult {
+		root, _ := args["path"].(string)
+		if root == "" {
+			root = m.getWorkspace()
+			if root == "" {
+				return ToolResult{Output: "错误: 无可用的工作区目录", Success: false}
+			}
+		} else {
+			root = m.resolveWorkspacePath(root)
+		}
+		root = expandPath(root)
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			return ToolResult{Output: fmt.Sprintf("路径错误: %v", err), Success: false}
+		}
+
+		maxDepth := 3
+		if v, ok := args["depth"].(float64); ok && v >= 1 {
+			maxDepth = int(v)
+			if maxDepth > 6 {
+				maxDepth = 6
+			}
+		}
+		pattern, _ := args["pattern"].(string)
+
+		result := buildFileTree(absRoot, maxDepth, pattern)
+		result = m.sanitizeOutput(result)
+		return ToolResult{Output: result, Success: true}
+	})
+
+	// ===== glob_file executor =====
+	m.RegisterBuiltinExecutor("glob_file", func(args map[string]any) ToolResult {
+		pattern, _ := args["pattern"].(string)
+		if pattern == "" {
+			return ToolResult{Output: "错误: pattern 参数为空", Success: false}
+		}
+		searchRoot, _ := args["path"].(string)
+		if searchRoot == "" {
+			searchRoot = m.getWorkspace()
+			if searchRoot == "" {
+				return ToolResult{Output: "错误: 无可用的工作区目录", Success: false}
+			}
+		} else {
+			searchRoot = m.resolveWorkspacePath(searchRoot)
+		}
+		searchRoot = expandPath(searchRoot)
+		absRoot, err := filepath.Abs(searchRoot)
+		if err != nil {
+			return ToolResult{Output: fmt.Sprintf("路径错误: %v", err), Success: false}
+		}
+
+		matches := globFiles(absRoot, pattern, 200)
+		if len(matches) == 0 {
+			return ToolResult{Output: "(无匹配文件)", Success: true}
+		}
+		result := strings.Join(matches, "\n")
+		result = m.sanitizeOutput(result)
+		return ToolResult{Output: result, Success: true}
+	})
+
+	// ===== grep_file executor =====
+	m.RegisterBuiltinExecutor("grep_file", func(args map[string]any) ToolResult {
+		pattern, _ := args["pattern"].(string)
+		if pattern == "" {
+			return ToolResult{Output: "错误: pattern 参数为空", Success: false}
+		}
+		searchPath, _ := args["path"].(string)
+		if searchPath == "" {
+			searchPath = m.getWorkspace()
+			if searchPath == "" {
+				return ToolResult{Output: "错误: 无可用的工作区目录", Success: false}
+			}
+		} else {
+			searchPath = m.resolveWorkspacePath(searchPath)
+		}
+		searchPath = expandPath(searchPath)
+		absPath, err := filepath.Abs(searchPath)
+		if err != nil {
+			return ToolResult{Output: fmt.Sprintf("路径错误: %v", err), Success: false}
+		}
+
+		include, _ := args["include"].(string)
+		caseSensitive := true
+		if v, ok := args["caseSensitive"].(bool); ok {
+			caseSensitive = v
+		}
+
+		matches := grepFiles(absPath, pattern, include, caseSensitive, 200)
+		if len(matches) == 0 {
+			return ToolResult{Output: "(无匹配内容)", Success: true}
+		}
+		result := strings.Join(matches, "\n")
+		result = m.sanitizeOutput(result)
+		return ToolResult{Output: result, Success: true}
+	})
+
+	// ===== edit_file executor =====
+	m.RegisterBuiltinExecutor("edit_file", func(args map[string]any) ToolResult {
+		path, _ := args["path"].(string)
+		oldText, _ := args["old_text"].(string)
+		newText, _ := args["new_text"].(string)
+		if path == "" {
+			return ToolResult{Output: "错误: path 参数为空", Success: false}
+		}
+		if oldText == "" {
+			return ToolResult{Output: "错误: old_text 参数为空", Success: false}
+		}
+		path = expandPath(m.resolveWorkspacePath(path))
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return ToolResult{Output: fmt.Sprintf("路径错误: %v", err), Success: false}
+		}
+
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			return ToolResult{Output: fmt.Sprintf("读取文件失败: %v", err), Success: false}
+		}
+		original := string(data)
+
+		if !strings.Contains(original, oldText) {
+			return ToolResult{Output: "错误: old_text 在文件中未找到，请确保文本完全匹配（包括缩进和空白）", Success: false}
+		}
+
+		replaceAll, _ := args["replaceAll"].(bool)
+		var updated string
+		if replaceAll {
+			updated = strings.ReplaceAll(original, oldText, newText)
+		} else {
+			updated = strings.Replace(original, oldText, newText, 1)
+		}
+
+		if err := os.WriteFile(absPath, []byte(updated), 0644); err != nil {
+			return ToolResult{Output: fmt.Sprintf("写入文件失败: %v", err), Success: false}
+		}
+
+		count := strings.Count(original, oldText)
+		if replaceAll {
+			displayPath := absPath
+			if ws := m.getWorkspace(); ws != "" {
+				if rel, err := filepath.Rel(ws, absPath); err == nil {
+					displayPath = rel
+				}
+			}
+			return ToolResult{Output: fmt.Sprintf("已更新 %s（替换了 %d 处）", displayPath, count), Success: true}
+		}
+		displayPath := absPath
+		if ws := m.getWorkspace(); ws != "" {
+			if rel, err := filepath.Rel(ws, absPath); err == nil {
+				displayPath = rel
+			}
+		}
+		return ToolResult{Output: fmt.Sprintf("已更新 %s（替换了 1 处）", displayPath), Success: true}
 	})
 
 	// ===== 浏览器激活工具 executor =====
@@ -616,3 +867,488 @@ func isTextContent(content string) bool {
 	}
 	return true
 }
+
+// skipDirs 需要跳过的目录名集合
+var skipDirs = map[string]bool{
+	".git": true, ".svn": true, ".hg": true,
+	"node_modules": true, "__pycache__": true, "vendor": true,
+	".venv": true, "venv": true, ".idea": true, ".vscode": true,
+	"dist": true, "build": true, ".next": true, ".nuxt": true,
+}
+
+// buildFileTree 构建递归目录树
+func buildFileTree(root string, maxDepth int, pattern string) string {
+	var sb strings.Builder
+	sb.WriteString(filepath.Base(root) + "/\n")
+	buildTreeRecursive(&sb, root, "", maxDepth, 0, pattern, 0)
+	lines := strings.Count(sb.String(), "\n")
+	if lines > 500 {
+		// 截断过大的输出
+		result := sb.String()
+		truncated := strings.Join(strings.SplitN(result, "\n", 502)[:500], "\n")
+		return truncated + "\n... (输出被截断，请缩小 depth 或使用 pattern 过滤)"
+	}
+	return sb.String()
+}
+
+func buildTreeRecursive(sb *strings.Builder, dir, prefix string, maxDepth, currentDepth int, pattern string, count int) int {
+	if currentDepth >= maxDepth || count > 500 {
+		return count
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return count
+	}
+
+	// 过滤掉需要跳过的目录和隐藏文件
+	var visible []os.DirEntry
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if e.IsDir() && skipDirs[name] {
+			continue
+		}
+		if pattern != "" && !e.IsDir() {
+			matched, _ := filepath.Match(pattern, name)
+			if !matched {
+				continue
+			}
+		}
+		visible = append(visible, e)
+	}
+
+	// 如果有 pattern 过滤，需要保留包含匹配文件的目录
+	if pattern != "" {
+		var filtered []os.DirEntry
+		for _, e := range visible {
+			if !e.IsDir() {
+				filtered = append(filtered, e)
+			} else {
+				// 检查子目录是否有匹配文件
+				if dirHasMatch(filepath.Join(dir, e.Name()), pattern, maxDepth-currentDepth-1) {
+					filtered = append(filtered, e)
+				}
+			}
+		}
+		visible = filtered
+	}
+
+	for i, e := range visible {
+		if count > 500 {
+			break
+		}
+		isLast := i == len(visible)-1
+		connector := "├── "
+		childPrefix := "│   "
+		if isLast {
+			connector = "└── "
+			childPrefix = "    "
+		}
+
+		if e.IsDir() {
+			fmt.Fprintf(sb, "%s%s%s/\n", prefix, connector, e.Name())
+			count++
+			count = buildTreeRecursive(sb, filepath.Join(dir, e.Name()), prefix+childPrefix, maxDepth, currentDepth+1, pattern, count)
+		} else {
+			fmt.Fprintf(sb, "%s%s%s\n", prefix, connector, e.Name())
+			count++
+		}
+	}
+	return count
+}
+
+// dirHasMatch 检查目录中是否有匹配 pattern 的文件
+func dirHasMatch(dir, pattern string, remainDepth int) bool {
+	if remainDepth < 0 {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") || skipDirs[name] {
+			continue
+		}
+		if !e.IsDir() {
+			if matched, _ := filepath.Match(pattern, name); matched {
+				return true
+			}
+		} else if dirHasMatch(filepath.Join(dir, name), pattern, remainDepth-1) {
+			return true
+		}
+	}
+	return false
+}
+
+// webSearch 使用 Bing 搜索
+func webSearch(query string, limit int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	searchURL := "https://www.bing.com/search?q=" + urlEncode(query) + "&count=" + fmt.Sprintf("%d", limit)
+	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
+	if err != nil {
+		return fmt.Sprintf("创建搜索请求失败: %v", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Sprintf("搜索请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Sprintf("读取搜索结果失败: %v", err)
+	}
+
+	return parseBingResults(string(body), limit)
+}
+
+// urlEncode 简单 URL 编码
+func urlEncode(s string) string {
+	var sb strings.Builder
+	for _, b := range []byte(s) {
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.' || b == '~' {
+			sb.WriteByte(b)
+		} else if b == ' ' {
+			sb.WriteByte('+')
+		} else {
+			fmt.Fprintf(&sb, "%%%02X", b)
+		}
+	}
+	return sb.String()
+}
+
+// parseBingResults 从 Bing 搜索页面解析结果
+// Bing 结果结构: <li class="b_algo"><h2><a href="URL">TITLE</a></h2><p class="b_lineclamp...">SNIPPET</p></li>
+func parseBingResults(html string, limit int) string {
+	type searchResult struct {
+		title, url, snippet string
+	}
+	var results []searchResult
+
+	remaining := html
+	for len(results) < limit {
+		// 找到下一个搜索结果块
+		algoIdx := strings.Index(remaining, `class="b_algo"`)
+		if algoIdx == -1 {
+			break
+		}
+		remaining = remaining[algoIdx:]
+
+		// 找 <h2> 中的链接
+		h2Idx := strings.Index(remaining, "<h2")
+		if h2Idx == -1 {
+			break
+		}
+
+		// 提取 href
+		hrefIdx := strings.Index(remaining[h2Idx:], `href="`)
+		if hrefIdx == -1 {
+			break
+		}
+		hrefStart := h2Idx + hrefIdx + 6
+		hrefEnd := strings.Index(remaining[hrefStart:], `"`)
+		if hrefEnd == -1 {
+			break
+		}
+		rawURL := htmlUnescape(remaining[hrefStart : hrefStart+hrefEnd])
+
+		// 提取标题: href 后面找 > 到 </a>
+		afterHref := remaining[hrefStart+hrefEnd:]
+		aOpen := strings.Index(afterHref, ">")
+		if aOpen == -1 {
+			break
+		}
+		aClose := strings.Index(afterHref[aOpen:], "</a>")
+		if aClose == -1 {
+			break
+		}
+		title := stripHTMLTags(afterHref[aOpen+1 : aOpen+aClose])
+
+		// 移到标题之后
+		remaining = remaining[hrefStart+hrefEnd+aOpen+aClose:]
+
+		// 提取摘要: 找 <p 或 <span 中的文本（在下一个 b_algo 之前）
+		snippet := ""
+		nextAlgo := strings.Index(remaining, `class="b_algo"`)
+		searchScope := remaining
+		if nextAlgo != -1 {
+			searchScope = remaining[:nextAlgo]
+		}
+		// Bing 摘要常见 class: b_lineclamp, b_paractl, b_dList
+		for _, marker := range []string{"b_lineclamp", "b_paractl", "b_dList"} {
+			snipIdx := strings.Index(searchScope, marker)
+			if snipIdx == -1 {
+				continue
+			}
+			snipRemain := searchScope[snipIdx:]
+			tagEnd := strings.Index(snipRemain, ">")
+			if tagEnd == -1 {
+				continue
+			}
+			// 找到对应的闭合标签（取前 500 字符范围）
+			endScope := snipRemain[tagEnd+1:]
+			if len(endScope) > 500 {
+				endScope = endScope[:500]
+			}
+			closeIdx := strings.Index(endScope, "</p>")
+			if closeIdx == -1 {
+				closeIdx = strings.Index(endScope, "</span>")
+			}
+			if closeIdx == -1 {
+				closeIdx = strings.Index(endScope, "</div>")
+			}
+			if closeIdx != -1 {
+				snippet = stripHTMLTags(endScope[:closeIdx])
+				break
+			}
+		}
+
+		title = strings.TrimSpace(title)
+		rawURL = strings.TrimSpace(rawURL)
+		snippet = strings.TrimSpace(snippet)
+
+		if title != "" && rawURL != "" && !strings.Contains(rawURL, "bing.com/ck/") {
+			results = append(results, searchResult{title: title, url: rawURL, snippet: snippet})
+		}
+	}
+
+	if len(results) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	for i, r := range results {
+		fmt.Fprintf(&sb, "%d. %s\n   %s\n", i+1, r.title, r.url)
+		if r.snippet != "" {
+			fmt.Fprintf(&sb, "   %s\n", r.snippet)
+		}
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// stripHTMLTags 去除 HTML 标签
+func stripHTMLTags(s string) string {
+	var sb strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+// htmlUnescape 简单 HTML 实体解码
+func htmlUnescape(s string) string {
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&#39;", "'")
+	s = strings.ReplaceAll(s, "&#x27;", "'")
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	return s
+}
+
+// urlDecode 简单 URL 解码
+func urlDecode(s string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			hi := unhex(s[i+1])
+			lo := unhex(s[i+2])
+			if hi >= 0 && lo >= 0 {
+				sb.WriteByte(byte(hi<<4 | lo))
+				i += 2
+				continue
+			}
+		} else if s[i] == '+' {
+			sb.WriteByte(' ')
+			continue
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
+}
+
+func unhex(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	default:
+		return -1
+	}
+}
+
+// globFiles 按 glob 模式搜索文件。优先使用 rg，回退到 filepath.WalkDir。
+func globFiles(root, pattern string, limit int) []string {
+	// 尝试用 ripgrep（自动尊重 .gitignore，跳过 .venv 等）
+	if rgPath, err := exec.LookPath("rg"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, rgPath, "--files", "--glob", pattern, ".")
+		cmd.Dir = root
+		out, err := cmd.Output()
+		if err == nil || cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 1 {
+			var matches []string
+			scanner := bufio.NewScanner(bytes.NewReader(out))
+			for scanner.Scan() && len(matches) < limit {
+				line := strings.TrimSpace(scanner.Text())
+				if line != "" {
+					matches = append(matches, line)
+				}
+			}
+			sort.Strings(matches)
+			return matches
+		}
+	}
+
+	// 回退: filepath.WalkDir + filepath.Match
+	var matches []string
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if len(matches) >= limit {
+			return filepath.SkipAll
+		}
+		// 跳过隐藏目录和常见大目录
+		if d.IsDir() {
+			name := d.Name()
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "__pycache__" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		matched, _ := filepath.Match(pattern, filepath.Base(rel))
+		if !matched {
+			// 也尝试用完整相对路径匹配（支持 **/ 模式的简化形式）
+			matched, _ = filepath.Match(pattern, rel)
+		}
+		if matched {
+			matches = append(matches, rel)
+		}
+		return nil
+	})
+	sort.Strings(matches)
+	return matches
+}
+
+// grepFiles 按正则搜索文件内容。优先使用 rg，回退到纯 Go 实现。
+func grepFiles(root, pattern, include string, caseSensitive bool, limit int) []string {
+	// 尝试用 ripgrep
+	if rgPath, err := exec.LookPath("rg"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		args := []string{"--no-heading", "--line-number", "--color", "never"}
+		if !caseSensitive {
+			args = append(args, "-i")
+		}
+		if include != "" {
+			args = append(args, "--glob", include)
+		}
+		args = append(args, "--", pattern, ".")
+
+		cmd := exec.CommandContext(ctx, rgPath, args...)
+		cmd.Dir = root
+		out, err := cmd.Output()
+		if err == nil || cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 1 {
+			var matches []string
+			scanner := bufio.NewScanner(bytes.NewReader(out))
+			// 增大 scanner 缓冲区以处理长行
+			scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+			for scanner.Scan() && len(matches) < limit {
+				line := scanner.Text()
+				if line != "" {
+					matches = append(matches, line)
+				}
+			}
+			return matches
+		}
+	}
+
+	// 回退: 纯 Go 正则搜索
+	flags := ""
+	if !caseSensitive {
+		flags = "(?i)"
+	}
+	re, err := regexp.Compile(flags + pattern)
+	if err != nil {
+		return []string{fmt.Sprintf("正则表达式错误: %v", err)}
+	}
+
+	var matches []string
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if len(matches) >= limit {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "__pycache__" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// 文件名过滤
+		if include != "" {
+			matched, _ := filepath.Match(include, d.Name())
+			if !matched {
+				return nil
+			}
+		}
+		// 跳过大文件
+		info, err := d.Info()
+		if err != nil || info.Size() > 2*1024*1024 {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		// 跳过二进制文件
+		if bytes.ContainsRune(data[:min(512, len(data))], 0) {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		for lineNo, line := range strings.Split(string(data), "\n") {
+			if len(matches) >= limit {
+				break
+			}
+			if re.MatchString(line) {
+				matches = append(matches, fmt.Sprintf("%s:%d:%s", rel, lineNo+1, line))
+			}
+		}
+		return nil
+	})
+	return matches
+}
+
